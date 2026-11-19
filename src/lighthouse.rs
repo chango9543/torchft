@@ -4,6 +4,9 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
+mod preemption;
+use preemption::Preemption;
+
 use core::net::SocketAddr;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -55,6 +58,7 @@ struct QuorumMemberDetails {
 }
 
 struct State {
+    preemption: Option<Preemption>,
     channel: broadcast::Sender<Quorum>,
     participants: HashMap<String, QuorumMemberDetails>,
     prev_quorum: Option<Quorum>,
@@ -281,6 +285,7 @@ impl Lighthouse {
                 prev_quorum: None,
                 quorum_id: 0,
                 heartbeats: HashMap::new(),
+                preemption: Preemption::from_env()?,
             }),
             opt,
             local_addr: listener.local_addr()?,
@@ -290,6 +295,16 @@ impl Lighthouse {
     }
 
     fn _quorum_tick(self: Arc<Self>, state: &mut State) -> Result<()> {
+        if let Some(p) = state.preemption.as_mut() {
+            if !p.before_tick(
+                &mut state.participants,
+                &mut state.heartbeats,
+                Duration::from_millis(self.opt.heartbeat_timeout_ms),
+                state.prev_quorum.as_ref(),
+            ) {
+                return Ok(());
+            }
+        }
         let (quorum_met, reason) = quorum_compute(Instant::now(), state, &self.opt);
         self.change_logger.log_if_changed(&reason);
 
@@ -332,6 +347,9 @@ impl Lighthouse {
 
             info!("Quorum! {:?}", quorum);
 
+            if let Some(p) = state.preemption.as_mut() {
+                p.published(&quorum);
+            }
             state.prev_quorum = Some(quorum.clone());
             state.participants.clear();
             match state.channel.send(quorum) {
@@ -368,6 +386,10 @@ impl Lighthouse {
 
         // Setup HTTP endpoints
         let app = Router::new()
+            .route("/preemption", post({
+                let lh = self.clone();
+                move |headers, cmd| preemption::control(lh, headers, cmd)
+            }))
             .route(
                 "/",
                 get(|| async { Html(IndexTemplate {}.render().unwrap()) }),
@@ -498,6 +520,9 @@ impl LighthouseService for Arc<Lighthouse> {
         let mut rx = {
             let mut state = self.state.lock().await;
 
+            if state.preemption.as_ref().is_some_and(|p| p.excluded(&requester.replica_id)) {
+                return Err(Status::failed_precondition("suspended instance"));
+            }
             // implicit heartbeat
             state
                 .heartbeats
@@ -533,6 +558,9 @@ impl LighthouseService for Arc<Lighthouse> {
 
             // Only continue the loop if the replica is not in the quorum
             let mut state = self.state.lock().await;
+            if state.preemption.as_ref().is_some_and(|p| p.excluded(&requester.replica_id)) {
+                return Err(Status::failed_precondition("suspended instance"));
+            }
             state.participants.insert(
                 requester.replica_id.clone(),
                 QuorumMemberDetails {
@@ -558,7 +586,9 @@ impl LighthouseService for Arc<Lighthouse> {
 
         {
             let mut state = self.state.lock().await;
-            state.heartbeats.insert(replica_id, Instant::now());
+            if !state.preemption.as_ref().is_some_and(|p| p.excluded(&replica_id)) {
+                state.heartbeats.insert(replica_id, Instant::now());
+            }
         }
 
         let reply = LighthouseHeartbeatResponse {};
@@ -640,6 +670,7 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            preemption: None,
         };
 
         let now = Instant::now();
@@ -719,6 +750,7 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            preemption: None,
         };
 
         let now = Instant::now();
@@ -805,6 +837,7 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            preemption: None,
         };
 
         let now = Instant::now();
@@ -895,6 +928,7 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            preemption: None,
         };
 
         let now = Instant::now();
@@ -1036,6 +1070,7 @@ mod tests {
             prev_quorum: None,
             quorum_id: 0,
             heartbeats: HashMap::new(),
+            preemption: None,
         };
 
         let now = Instant::now();
